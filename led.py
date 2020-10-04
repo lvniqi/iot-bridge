@@ -8,44 +8,37 @@ import urllib
 import urllib.request
 import urllib.parse
 
-
+#%% controller
 class naive_controller(object):
     #ison = is on now
-    def __init__(self,freeze_timeout=15,ison=False):
+    def __init__(self, freeze_timeout=15, ison=False):
         self._ison = ison
         self._freeze_timeout = freeze_timeout
         self._last_on_time = time.time()
-    
+        self._type = 'controller'
+
     @property
     def ison(self):
         """Return true if switch is on."""
         return self._ison
 
-
     def on(self, **kwargs):
         """Turn the switch on."""
-        if not self._ison:
-            self._ison = True
-        self._last_on_time = time.time()
+        raise NotImplementedError("method on is not implemented.")
 
     def off(self, **kwargs):
         """Turn the switch off."""
-        is_force = kwargs.get('is_force', False)
-        if (self._ison and self.check_timeout()) or is_force:
-            self._ison = False
+        raise NotImplementedError("method off is not implemented.")
 
     def check_timeout(self):
         return time.time() - self._last_on_time > self._freeze_timeout
 
-    def run_step(self):
-        pass
-    
 
 class tasmota_controller(naive_controller):
     #ison = is on now
-    def __init__(self,host,freeze_timeout=15,ison=False):
+    def __init__(self, host, freeze_timeout=15, ison=False):
         self._host = host
-        super().__init__(freeze_timeout=freeze_timeout,ison=ison)
+        super().__init__(freeze_timeout=freeze_timeout, ison=ison)
 
     def on(self, **kwargs):
         """Turn the switch on."""
@@ -71,142 +64,144 @@ class tasmota_controller(naive_controller):
             except Exception as e:
                 print(e)
 
+
 class udp_local_controller(naive_controller):
     #ison = is on now
-    def __init__(self,host,port,freeze_timeout=15,ison=False,on_msg = 'door close', off_msg = 'door open'):
+    def __init__(self,
+                 host,
+                 port,
+                 freeze_timeout=15,
+                 ison=False,
+                 on_msg='door close',
+                 off_msg='door open'):
         self._host = host
         self._port = port
-        self._on_msg = on_msg
-        self._off_msg = off_msg
-        self._sock = socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-        self._sock.setsockopt(socket.SOL_SOCKET,socket.SO_BROADCAST,1)
-        super().__init__(freeze_timeout=freeze_timeout,ison=ison)
-    
+        self._on_msg = on_msg.encode('utf-8') if type(on_msg) == str else on_msg
+        self._off_msg = off_msg.encode('utf-8') if type(off_msg) == str else off_msg
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        super().__init__(freeze_timeout=freeze_timeout, ison=ison)
 
     def __del__(self):
         self._sock.close()
 
-
     def on(self, **kwargs):
-        self._sock.sendto(self._on_msg,(self._host,self._port))
+        force_state = kwargs.get('force_state', True)
+        if force_state:
+            self._sock.sendto(self._on_msg, (self._host, self._port))
+        else:
+            self.off(**kwargs)
 
     def off(self, **kwargs):
-        self._sock.sendto(self._off_msg,(self._host,self._port))
+        self._sock.sendto(self._off_msg, (self._host, self._port))
 
-
-class fusion_controller(tasmota_controller):
-    def __init__(self, api_key, device_id, host, init_freeze_timeout=15, remote_freeze_timeout=600, ison=False):
-        self.api_key = api_key
-        self.device_id = device_id
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.time = None
+#%% remote
+class naive_remote(object):
+    def __init__(self, remote_freeze_timeout=600):
+        self._remote_freeze_timeout = remote_freeze_timeout
+        self._time = None
         self.update_time()
-        self.loop = asyncio.get_event_loop()
-        ##% for remote
-        self.remote_freeze_timeout = remote_freeze_timeout
-        self.last_remote_time = - self.remote_freeze_timeout
-        #% end for remote time
-        super().__init__(host,init_freeze_timeout,ison)
+        self._type = 'remote'
+        self._force_state = False
 
-    def connect(self):
+    def login(self):
+        raise NotImplementedError("method login is not implemented.")
+
+    def update_time(self):
+        self._time = time.time()
+
+    def run_one_step(self):
+        raise NotImplementedError("method run_one_step is not implemented.")
+
+    def remote_on(self, **kwargs):
+        raise NotImplementedError("method remote_on is not implemented")
+
+    def remote_off(self, **kwargs):
+        raise NotImplementedError("method remote_off is not implemented.")
+
+    @property
+    def force_state(self):
+        return self._force_state
+
+
+class bigiot_remote(naive_remote):
+    def __init__(self, api_key, device_id, remote_freeze_timeout=600):
+        super().__init__(remote_freeze_timeout=remote_freeze_timeout)
+        self._api_key = api_key
+        self._device_id = device_id
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._loop = asyncio.get_event_loop()
+        self._last_remote_time = -self._remote_freeze_timeout
+
+    def login(self):
+        #connect first
         host = "www.bigiot.net"
         port = 8181
         while True:
             try:
-                self.sock.connect((host, port))
+                self._sock.connect((host, port))
                 break
-            except:
+            except Exception as e:
                 print('waiting for connect bigiot.net...')
+                print('error is ', e)
                 time.sleep(2)
-
-    def login(self):
+        #then login
         checkinBytes = bytes(
-            '{\"M\":\"checkin\",\"ID\":\"' + self.device_id + '\",\"K\":\"' +
-            self.api_key + '\"}\n',
+            '{\"M\":\"checkin\",\"ID\":\"' + self._device_id + '\",\"K\":\"' +
+            self._api_key + '\"}\n',
             encoding='utf8')
-        self.sock.settimeout(0)
-        self.sock.sendall(checkinBytes)
+        self._sock.settimeout(0)
+        self._sock.sendall(checkinBytes)
 
-    def process(self, msg):
+    def _process(self, msg):
         msg = json.loads(msg)
         if msg['M'] == 'say':
             if msg['C'] == 'play':
-                self.last_remote_time = time.time()
-                self.on()
+                self._force_state = True
+                self._last_remote_time = time.time()
+                self.remote_on()
                 #print('on')
             elif msg['C'] == 'stop':
-                self.last_remote_time =  - self.remote_freeze_timeout
-                self.off(is_force=True)
+                self._force_state = False
+                self._last_remote_time = -self._remote_freeze_timeout
+                if time.time(
+                ) - self._last_remote_time > self._remote_freeze_timeout:
+                    self.remote_off(is_force=True)
                 #print('off')
         elif msg['M'] == 'checked':
             pass
         else:
             print(msg)
-        # print(msg)
 
-    def off(self, **kwargs):
-        #check if not remote time out
-        if time.time() - self.last_remote_time > self.remote_freeze_timeout:
-            super().off(**kwargs)
-
-
-
-    def keep_online(self):
-        if time.time() - self.time > 40:
+    def _keep_online(self):
+        if time.time() - self._time > 40:
             try:
-                self.sock.sendall(b'{\"M\":\"status\"}\n')
+                self._sock.sendall(b'{\"M\":\"status\"}\n')
             except BrokenPipeError as e:
                 print(e)
                 print('reinit now')
-                self.re_login()
-                
+                self._relogin()
             self.update_time()
 
-    def re_login(self):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.connect()
-        self.login()
+    async def _keep_online_run_step(self):
+        self._keep_online()
 
-    def update_time(self):
-        self.time = time.time()
-
-    async def keep_online_run_async(self):
-        while True:
-            await self.keep_online_run_step()
-            await asyncio.sleep(1)
-
-    async def keep_online_run_step(self):
-        self.keep_online()
-
-    def run_one_step(self):
-        tasks = [
-            asyncio.ensure_future(self.main_run_step()),
-            asyncio.ensure_future(self.keep_online_run_step()),
-        ]
-
-        self.loop.run_until_complete(asyncio.wait(tasks))
-
-    async def main_run_async(self):
-        while True:
-            await self.main_run_step()
-    
-    async def main_run_step(self):
+    async def _main_run_step(self):
         try:
-            msg = await self.get_message()
+            msg = await self._get_message()
             if msg:
-                self.process(msg)
+                self._process(msg)
         except Exception as e:
             print(e)
 
-
-    async def get_message(self):
+    async def _get_message(self):
         data = b''
         d = b''
         retry_count = 3
         for _ in range(1024):
             try:
-                d = self.sock.recv(1)
+                d = self._sock.recv(1)
             except BlockingIOError as e:
                 retry_count -= 1
                 if data == b'' or retry_count == 0:
@@ -226,19 +221,109 @@ class fusion_controller(tasmota_controller):
                 return str(data, encoding='utf-8')
         return ''
 
+    def run_one_step(self):
+        tasks = [
+            asyncio.ensure_future(self._main_run_step()),
+            asyncio.ensure_future(self._keep_online_run_step()),
+        ]
+
+        self._loop.run_until_complete(asyncio.wait(tasks))
+
     def __del__(self):
-        self.loop.close()
+        self._loop.close()
+        self._sock.close()
+
+    def _relogin(self):
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.login()
+
+
+class fusion_remote_controller(object):
+    def __init__(self, **kwargs):
+        self.remote = kwargs['remote']
+        self.controller = kwargs['controller']
+        self.remote.remote_on = lambda **kwargs: self.controller.on(**kwargs)
+        self.remote.remote_off = lambda **kwargs: self.controller.off(**kwargs)
+        self.remote.login()
+
+    def on(self, **kwargs):
+        kwargs['force_state'] = self.remote.force_state
+        self.controller.on(**kwargs)
+
+    def off(self, **kwargs):
+        kwargs['force_state'] = self.remote.force_state
+        self.controller.off(**kwargs)
+
+    def run_one_step(self):
+        self.remote.run_one_step()
+
+    @property
+    def ison(self):
+        return self.controller.ison
+
+#%% factory functions
+def get_remote(type, **kwargs):
+    if type == 'bigiot_remote':
+        co_varnames = [
+            x for x in bigiot_remote.__init__.__code__.co_varnames
+            if x != 'self'
+        ]
+        kwargs = dict([(k, v) for k, v in kwargs.items() if k in co_varnames])
+        return bigiot_remote(**kwargs)
+    else:
+        raise KeyError("type %s is not find" % str(type))
+
+
+def get_controller(type, **kwargs):
+    if type == 'udp_local_controller':
+        co_varnames = [
+            x for x in udp_local_controller.__init__.__code__.co_varnames
+            if x != 'self'
+        ]
+        kwargs = dict([(k, v) for k, v in kwargs.items() if k in co_varnames])
+        return udp_local_controller(**kwargs)
+    elif type == 'tasmota_controller':
+        co_varnames = [
+            x for x in tasmota_controller.__init__.__code__.co_varnames
+            if x != 'self'
+        ]
+        kwargs = dict([(k, v) for k, v in kwargs.items() if k in co_varnames])
+        return tasmota_controller(**kwargs)
+    elif type == 'fusion_controller':
+        remote = get_remote(kwargs['remote'], **kwargs)
+        controller = get_controller(kwargs['controller'], **kwargs)
+        return fusion_remote_controller(remote=remote, controller=controller)
+    else:
+        raise KeyError("type %s is not find" % str(type))
 
 
 if __name__ == "__main__":
     #must be modified===
-    #device_id = 'xxx'
-    #api_key = 'xxxxxxx'
-    #host = "xxx.xxx.xxx.xxx"
+    device_id = 'xxx'
+    api_key = 'xxxxxxx'
+    host = "xxx.xxx.xxx.xxx"
     #modify end=========
-    device = fusion_controller(api_key, device_id, host)
-    device.connect()
-    device.login()
+    #tasmota_controller_t = get_controller(type='tasmota_controller',host=host)
+    #bigiot_remote_t = get_remote(type='bigiot_remote',api_key=api_key, device_id=device_id)
+
+    device = get_controller(
+        type='fusion_controller',
+        remote='bigiot_remote',
+        controller='tasmota_controller',
+        api_key=api_key,
+        device_id=device_id,
+        host=host)
+
+    host = "xxx.xxx.x.xxx"
+    port = 55005
+    device = get_controller(
+        type='fusion_controller',
+        remote='bigiot_remote',
+        controller='udp_local_controller',
+        api_key=api_key,
+        device_id=device_id,
+        host=host,
+        port=port)
 
     while True:
         device.run_one_step()
