@@ -54,7 +54,9 @@ class tasmota_controller(naive_controller):
 
     def off(self, **kwargs):
         """Turn the switch off."""
+        force_state = kwargs.get('force_state', False)
         is_force = kwargs.get('is_force', False)
+        last_remote_time = kwargs.get('last_remote_time', -1)
         if (self._ison and self.check_timeout()) or is_force:
             try:
                 url = f"http://{self._host}/cm?cmnd=Power%20Off"
@@ -104,6 +106,7 @@ class naive_remote(object):
         self.update_time()
         self._type = 'remote'
         self._force_state = False
+        self._last_remote_time = -self._remote_freeze_timeout
 
     def login(self):
         raise NotImplementedError("method login is not implemented.")
@@ -121,6 +124,15 @@ class naive_remote(object):
         raise NotImplementedError("method remote_off is not implemented.")
 
     @property
+    def enable_off(self):
+        if self.force_state and time.time() - self._last_remote_time < self._remote_freeze_timeout:
+            return False
+        return True
+
+    @property
+    def last_remote_time(self):
+        return self._last_remote_time
+    @property
     def force_state(self):
         return self._force_state
 
@@ -132,7 +144,6 @@ class bigiot_remote(naive_remote):
         self._device_id = device_id
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._loop = asyncio.get_event_loop()
-        self._last_remote_time = -self._remote_freeze_timeout
 
     def login(self):
         #connect first
@@ -248,11 +259,14 @@ class fusion_remote_controller(object):
 
     def on(self, **kwargs):
         kwargs['force_state'] = self.remote.force_state
+        kwargs['last_remote_time'] = self.remote.last_remote_time
         self.controller.on(**kwargs)
 
     def off(self, **kwargs):
-        kwargs['force_state'] = self.remote.force_state
-        self.controller.off(**kwargs)
+        if self.remote.enable_off:
+            kwargs['force_state'] = self.remote.force_state
+            kwargs['last_remote_time'] = self.remote.last_remote_time
+            self.controller.off(**kwargs)
 
     def run_one_step(self):
         self.remote.run_one_step()
